@@ -1,0 +1,10 @@
+#
+# DROI misc devices configuration
+#
+
+config DROI_POWER_RST_GPIO
+	tristate "DROI power rst gpio configuration"
+	default n
+	help
+	  DROI power rst gpio configuration.
+

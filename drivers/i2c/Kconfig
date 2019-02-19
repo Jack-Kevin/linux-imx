@@ -118,6 +118,9 @@ if I2C_SLAVE
 config I2C_SLAVE_EEPROM
 	tristate "I2C eeprom slave driver"
 
+config I2C_SLAVE_NXPINFO
+	tristate "I2C nxpinfo slave driver"
+
 endif
 
 config I2C_DEBUG_CORE

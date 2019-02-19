@@ -53,6 +53,7 @@
 #include <linux/platform_device.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/pm_runtime.h>
 
 /** Defines ********************************************************************
 *******************************************************************************/
@@ -209,6 +210,9 @@ struct imx_i2c_struct {
 	const struct imx_i2c_hwdata	*hwdata;
 
 	struct imx_i2c_dma	*dma;
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
+	struct i2c_client *slave;
+#endif
 };
 
 static const struct imx_i2c_hwdata imx1_i2c_hwdata  = {
@@ -579,6 +583,113 @@ static void i2c_imx_stop(struct imx_i2c_struct *i2c_imx)
 	clk_disable_unprepare(i2c_imx->clk);
 }
 
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
+static void i2c_imx_restart(struct imx_i2c_struct *i2c_imx)
+{
+	unsigned int temp = 0;
+
+	/* Disable I2C controller */
+	temp = i2c_imx->hwdata->i2cr_ien_opcode ^ I2CR_IEN,
+	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+	udelay(10);
+
+	/* Enable I2C controller */
+	imx_i2c_write_reg(i2c_imx->hwdata->i2sr_clr_opcode, i2c_imx, IMX_I2C_I2SR);
+	imx_i2c_write_reg(i2c_imx->hwdata->i2cr_ien_opcode, i2c_imx, IMX_I2C_I2CR);
+
+	/* Wait controller to be stable */
+	udelay(50);
+
+	/* set I2C to slave mode */
+	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+	temp &= ~I2CR_MSTA;
+	temp |= I2CR_IIEN/* | I2CR_MTX | I2CR_TXAK*/;
+	temp &= ~I2CR_DMAEN;
+	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+}
+
+static bool i2c_imx_slave_isr(struct imx_i2c_struct *i2c_imx)
+{
+	unsigned int temp;
+	u8 value;
+
+	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+	// master mode ?
+	if (temp & I2CR_MSTA)
+		return false;
+
+	if (!i2c_imx->slave)
+		return false;
+
+	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
+
+	// arbitration lost ?
+	if (temp & I2SR_IAL) {
+		temp &= ~I2SR_IAL;
+		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2SR);
+
+		// address ?
+		if (!(temp & I2SR_IAAS)) {
+			return true;
+		}
+	}
+
+	// address ?
+	if (temp & I2SR_IAAS) {
+		// SRW = 1 ?
+		if (temp & I2SR_SRW) {
+			i2c_slave_event(i2c_imx->slave, I2C_SLAVE_READ_REQUESTED, &value);
+			// set tx mode
+			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+			temp |= I2CR_MTX;
+			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+			imx_i2c_write_reg(value, i2c_imx, IMX_I2C_I2DR);
+		} else {
+			i2c_slave_event(i2c_imx->slave, I2C_SLAVE_WRITE_REQUESTED, &value);
+			// set rx mode
+			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+			temp &= ~I2CR_MTX;
+			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+			imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR); // dummy read
+		}
+	} else {
+		// tx/rx ?
+		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+		if (temp & I2CR_MTX) {
+			// tx mode
+			// ack ?
+			if (temp & I2SR_RXAK) {
+				// no ack
+				// set to rx mode
+				temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+				temp &= ~I2CR_MTX;
+				imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+				imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR); // dummy read
+			} else {
+				// tx next byte
+				temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+				temp |= I2CR_TXAK;
+				imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+				i2c_imx_restart(i2c_imx);
+			}
+		} else {
+			// rx mode
+			int ret;
+
+			value = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
+			ret = i2c_slave_event(i2c_imx->slave, I2C_SLAVE_WRITE_RECEIVED, &value);
+			// return ack/nack
+			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+			temp &= ~I2CR_TXAK;
+			temp |= (ret < 0 ? I2CR_TXAK : 0);
+			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+		}
+	}
+
+	return true;
+}
+#endif
+
 static irqreturn_t i2c_imx_isr(int irq, void *dev_id)
 {
 	struct imx_i2c_struct *i2c_imx = dev_id;
@@ -591,6 +702,12 @@ static irqreturn_t i2c_imx_isr(int irq, void *dev_id)
 		temp &= ~I2SR_IIF;
 		temp |= (i2c_imx->hwdata->i2sr_clr_opcode & I2SR_IIF);
 		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2SR);
+
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
+		if (i2c_imx_slave_isr(i2c_imx))
+			return IRQ_HANDLED;
+#endif
+
 		wake_up(&i2c_imx->queue);
 		return IRQ_HANDLED;
 	}
@@ -963,9 +1080,76 @@ static u32 i2c_imx_func(struct i2c_adapter *adapter)
 		| I2C_FUNC_SMBUS_READ_BLOCK_DATA;
 }
 
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
+static int imx_reg_slave(struct i2c_client *slave)
+{
+	struct imx_i2c_struct *i2c_imx = i2c_get_adapdata(slave->adapter);
+	unsigned int temp = 0;
+	int result;
+
+	if (i2c_imx->slave)
+		return -EBUSY;
+
+	if (slave->flags & I2C_CLIENT_TEN)
+		return -EAFNOSUPPORT;
+
+	pm_runtime_forbid(i2c_imx->adapter.dev.parent);
+
+	i2c_imx->slave = slave;
+
+	// set data sampling rate
+	i2c_imx_set_clk(i2c_imx);
+	result = clk_prepare_enable(i2c_imx->clk);
+	if (result)
+		return result;
+	imx_i2c_write_reg(i2c_imx->ifdr, i2c_imx, IMX_I2C_IFDR);
+
+	/* Enable I2C controller */
+	imx_i2c_write_reg(i2c_imx->hwdata->i2sr_clr_opcode, i2c_imx, IMX_I2C_I2SR);
+	imx_i2c_write_reg(i2c_imx->hwdata->i2cr_ien_opcode, i2c_imx, IMX_I2C_I2CR);
+
+	/* Wait controller to be stable */
+	udelay(50);
+
+	imx_i2c_write_reg((slave->addr & 0x7f) << 1, i2c_imx, IMX_I2C_IADR);
+
+	/* set I2C to slave mode */
+	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+	temp &= ~I2CR_MSTA;
+	temp |= I2CR_IIEN/* | I2CR_MTX | I2CR_TXAK*/;
+	temp &= ~I2CR_DMAEN;
+	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+
+	return 0;
+}
+
+static int imx_unreg_slave(struct i2c_client *slave)
+{
+	struct imx_i2c_struct *i2c_imx = i2c_get_adapdata(slave->adapter);
+	unsigned int temp = 0;
+
+	WARN_ON(!i2c_imx->slave);
+
+	/* Disable I2C controller */
+	temp = i2c_imx->hwdata->i2cr_ien_opcode ^ I2CR_IEN,
+	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+
+	i2c_imx->slave = NULL;
+
+	pm_runtime_allow(i2c_imx->adapter.dev.parent);
+	clk_disable_unprepare(i2c_imx->clk);
+
+	return 0;
+}
+#endif
+
 static struct i2c_algorithm i2c_imx_algo = {
 	.master_xfer	= i2c_imx_xfer,
 	.functionality	= i2c_imx_func,
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
+	.reg_slave	= imx_reg_slave,
+	.unreg_slave	= imx_unreg_slave,
+#endif
 };
 
 static int i2c_imx_probe(struct platform_device *pdev)
